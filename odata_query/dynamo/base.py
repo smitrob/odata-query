@@ -193,11 +193,11 @@ class AstToDynamoVisitor(visitor.NodeVisitor):
 
     def visit_And(self, node: ast.And) -> str:
         ":meta private:"
-        return "AND"
+        return "and"
 
     def visit_Or(self, node: ast.Or) -> str:
         ":meta private:"
-        return "OR"
+        return "or"
 
     def visit_BoolOp(self, node: ast.BoolOp) -> str:
         ":meta private:"
@@ -217,7 +217,7 @@ class AstToDynamoVisitor(visitor.NodeVisitor):
 
     def visit_Not(self, node: ast.Not) -> str:
         ":meta private:"
-        return "NOT"
+        return "not"
 
     def visit_UnaryOp(self, node: ast.UnaryOp) -> str:
         ":meta private:"
