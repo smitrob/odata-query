@@ -133,7 +133,7 @@ class AstToDynamoVisitor(visitor.NodeVisitor):
 
     def visit_NotEq(self, node: ast.NotEq) -> str:
         ":meta private:"
-        return "!="
+        return "ne"
 
     def visit_Lt(self, node: ast.Lt) -> str:
         ":meta private:"
