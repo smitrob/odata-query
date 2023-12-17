@@ -1,4 +1,4 @@
-[tool.poetry]
+[project]
 name = "odata-query"
 version = "0.9.1"
 description = "An OData query parser and transpiler."
