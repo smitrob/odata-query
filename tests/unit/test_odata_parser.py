@@ -75,32 +75,36 @@ def test_primitive_literal_parsing(value: str, expected_type: type):
 @pytest.mark.parametrize(
     "value, expected_unpacked",
     [
-        ("duration'P12DT23H59M59.9S'", (None, "12", "23", "59", "59.9")),
-        ("duration'-P12DT23H59M59.9S'", ("-", "12", "23", "59", "59.9")),
-        ("duration'P12D'", (None, "12", None, None, None)),
-        ("duration'-P12D'", ("-", "12", None, None, None)),
-        ("duration'PT23H59M59.9S'", (None, None, "23", "59", "59.9")),
-        ("duration'-PT23H59M59.9S'", ("-", None, "23", "59", "59.9")),
-        ("duration'PT23H59M59.9S'", (None, None, "23", "59", "59.9")),
-        ("duration'-PT23H59M59.9S'", ("-", None, "23", "59", "59.9")),
-        ("duration'PT23H59M59S'", (None, None, "23", "59", "59")),
-        ("duration'-PT23H59M59S'", ("-", None, "23", "59", "59")),
-        ("duration'PT23H'", (None, None, "23", None, None)),
-        ("duration'-PT23H'", ("-", None, "23", None, None)),
-        ("duration'PT59M'", (None, None, None, "59", None)),
-        ("duration'-PT59M'", ("-", None, None, "59", None)),
-        ("duration'PT59S'", (None, None, None, None, "59")),
-        ("duration'-PT59S'", ("-", None, None, None, "59")),
-        ("duration'PT59.9S'", (None, None, None, None, "59.9")),
-        ("duration'-PT59.9S'", ("-", None, None, None, "59.9")),
-        ("duration'P12DT23H'", (None, "12", "23", None, None)),
-        ("duration'-P12DT23H'", ("-", "12", "23", None, None)),
-        ("duration'P12DT59M'", (None, "12", None, "59", None)),
-        ("duration'-P12DT59M'", ("-", "12", None, "59", None)),
-        ("duration'P12DT59S'", (None, "12", None, None, "59")),
-        ("duration'-P12DT59S'", ("-", "12", None, None, "59")),
-        ("duration'P12DT59.9S'", (None, "12", None, None, "59.9")),
-        ("duration'-P12DT59.9S'", ("-", "12", None, None, "59.9")),
+        ("duration'P12DT23H59M59.9S'", (None, None, None, "12", "23", "59", "59.9")),
+        ("duration'-P12DT23H59M59.9S'", ("-", None, None, "12", "23", "59", "59.9")),
+        ("duration'P12D'", (None, None, None, "12", None, None, None)),
+        ("duration'-P12D'", ("-", None, None, "12", None, None, None)),
+        ("duration'PT23H59M59.9S'", (None, None, None, None, "23", "59", "59.9")),
+        ("duration'-PT23H59M59.9S'", ("-", None, None, None, "23", "59", "59.9")),
+        ("duration'PT23H59M59.9S'", (None, None, None, None, "23", "59", "59.9")),
+        ("duration'-PT23H59M59.9S'", ("-", None, None, None, "23", "59", "59.9")),
+        ("duration'PT23H59M59S'", (None, None, None, None, "23", "59", "59")),
+        ("duration'-PT23H59M59S'", ("-", None, None, None, "23", "59", "59")),
+        ("duration'PT23H'", (None, None, None, None, "23", None, None)),
+        ("duration'-PT23H'", ("-", None, None, None, "23", None, None)),
+        ("duration'PT59M'", (None, None, None, None, None, "59", None)),
+        ("duration'-PT59M'", ("-", None, None, None, None, "59", None)),
+        ("duration'PT59S'", (None, None, None, None, None, None, "59")),
+        ("duration'-PT59S'", ("-", None, None, None, None, None, "59")),
+        ("duration'PT59.9S'", (None, None, None, None, None, None, "59.9")),
+        ("duration'-PT59.9S'", ("-", None, None, None, None, None, "59.9")),
+        ("duration'P12DT23H'", (None, None, None, "12", "23", None, None)),
+        ("duration'-P12DT23H'", ("-", None, None, "12", "23", None, None)),
+        ("duration'P12DT59M'", (None, None, None, "12", None, "59", None)),
+        ("duration'-P12DT59M'", ("-", None, None, "12", None, "59", None)),
+        ("duration'P12DT59S'", (None, None, None, "12", None, None, "59")),
+        ("duration'-P12DT59S'", ("-", None, None, "12", None, None, "59")),
+        ("duration'P12DT59.9S'", (None, None, None, "12", None, None, "59.9")),
+        ("duration'-P12DT59.9S'", ("-", None, None, "12", None, None, "59.9")),
+        ("duration'-P1Y'", ("-", "1", None, None, None, None, None)),
+        ("duration'P1Y'", (None, "1", None, None, None, None, None)),
+        ("duration'-P12M'", ("-", None, "12", None, None, None, None)),
+        ("duration'P2Y3M'", (None, "2", "3", None, None, None, None)),
     ],
 )
 def test_duration_parsing(value: str, expected_unpacked: tuple):
@@ -108,6 +112,22 @@ def test_duration_parsing(value: str, expected_unpacked: tuple):
 
     assert isinstance(res, ast.Duration)
     assert res.unpack() == expected_unpacked
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (
+            "geography'SRID=0;Point(142.1 64.1)'",
+            ast.Geography("SRID=0;Point(142.1 64.1)"),
+        )
+    ],
+)
+def test_geography_literal_parsing(value: str, expected: str):
+    res = parse(value, "primitive_literal")
+
+    assert isinstance(res, ast.Geography)
+    assert res == expected
 
 
 @pytest.mark.parametrize(
@@ -150,6 +170,9 @@ def test_duration_parsing(value: str, expected_unpacked: tuple):
             dt.timedelta(days=12, hours=23, minutes=59, seconds=59.9),
         ),
         ("duration'P12D'", dt.timedelta(days=12)),
+        ("duration'P1Y'", dt.timedelta(days=365.25)),  # Average including leap years
+        ("duration'P1M'", dt.timedelta(days=30.44)),  # Average month length
+        ("duration'P1M2D'", dt.timedelta(days=32.44)),
     ],
 )
 def test_python_value_of_literals(odata_val: str, exp_py_val):
@@ -421,6 +444,13 @@ def test_bool_common_expr(expression: str, expected_ast: ast._Node):
         (
             "concat('abc', 'def')",
             ast.Call(ast.Identifier("concat"), [ast.String("abc"), ast.String("def")]),
+        ),
+        (
+            "geo.distance(home,geography'SRID=0;Point(142.1 64.1)')",
+            ast.Call(
+                ast.Identifier("distance", namespace=("geo",)),
+                [ast.Identifier("home"), ast.Geography("SRID=0;Point(142.1 64.1)")],
+            ),
         ),
     ],
 )

@@ -1,4 +1,5 @@
 import operator
+from functools import wraps
 from typing import Any, Callable, Dict, List, Optional, Type, Union
 from uuid import UUID
 
@@ -16,6 +17,17 @@ from django.db.models import (
     lookups,
 )
 from django.db.models.expressions import Expression
+
+try:
+    # Django gis requires system level libraries, which not every user needs.
+    from django.contrib.gis.db.models import functions as gis_functions
+    from django.contrib.gis.geos import GEOSGeometry
+
+    _gis_error = None
+except Exception as e:
+    gis_functions = None
+    GEOSGeometry = None
+    _gis_error = e
 
 from odata_query import ast, exceptions as ex, typing, utils, visitor
 
@@ -38,6 +50,18 @@ COMPARISON_FLIP = {
     ast.Gt: ast.Lt,
     ast.GtE: ast.LtE,
 }
+
+
+def requires_gis(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not gis_functions:
+            raise ImportError(
+                "Cannot use geography functions because GeoDjango failed to load."
+            ) from _gis_error
+        return func(*args, **kwargs)
+
+    return wrapper
 
 
 class AstToDjangoQVisitor(visitor.NodeVisitor):
@@ -254,12 +278,23 @@ class AstToDjangoQVisitor(visitor.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> Union[Expression, Q]:
         ":meta private:"
-        try:
-            q_gen = getattr(self, "djangofunc_" + node.func.name.lower())
-        except AttributeError:
-            raise ex.UnsupportedFunctionException(node.func.name)
 
-        res = q_gen(*node.args)
+        func_name = node.func.full_name().replace(".", "__")
+
+        try:
+            q_gen = getattr(self, "djangofunc_" + func_name.lower())
+        except AttributeError:
+            raise ex.UnsupportedFunctionException(func_name)
+
+        args = []
+        kwargs = {}
+        for arg in node.args:
+            if isinstance(arg, ast.NamedParam):
+                kwargs[arg.name.name] = arg.param
+            else:
+                args.append(arg)
+
+        res = q_gen(*args, **kwargs)
         return res
 
     def visit_CollectionLambda(self, node: ast.CollectionLambda) -> Q:
@@ -302,6 +337,20 @@ class AstToDjangoQVisitor(visitor.NodeVisitor):
 
         else:
             raise NotImplementedError()
+
+    @requires_gis
+    def djangofunc_geo__intersects(
+        self, field: ast.Identifier, geography: ast.Geography
+    ):
+        return Q(**{field.name + "__" + "intersects": GEOSGeometry(geography.wkt())})
+
+    @requires_gis
+    def djangofunc_geo__distance(self, field: ast.Identifier, geography: ast.Geography):
+        return gis_functions.Distance(field.name, GEOSGeometry(geography.wkt()))
+
+    @requires_gis
+    def djangofunc_geo__length(self, field: ast.Identifier):
+        return gis_functions.Length(field.name)
 
     def djangofunc_contains(
         self, field: ast._Node, substr: ast._Node

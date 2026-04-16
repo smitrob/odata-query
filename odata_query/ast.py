@@ -6,7 +6,9 @@ from uuid import UUID
 
 from dateutil.parser import isoparse
 
-DURATION_PATTERN = re.compile(r"([+-])?P(\d+D)?(?:T(\d+H)?(\d+M)?(\d+(?:\.\d+)?S)?)?")
+DURATION_PATTERN = re.compile(
+    r"([+-])?P(\d+Y)?(\d+M)?(\d+D)?(?:T(\d+H)?(\d+M)?(\d+(?:\.\d+)?S)?)?"
+)
 
 
 @dataclass(frozen=True)
@@ -18,6 +20,9 @@ class _Node:
 class Identifier(_Node):
     name: str
     namespace: Tuple[str, ...] = field(default_factory=tuple)
+
+    def full_name(self):
+        return ".".join(self.namespace + (self.name,))
 
 
 @dataclass(frozen=True)
@@ -82,6 +87,14 @@ class String(_Literal):
 
 
 @dataclass(frozen=True)
+class Geography(_Literal):
+    val: str
+
+    def wkt(self):
+        return self.val
+
+
+@dataclass(frozen=True)
 class Date(_Literal):
     val: str
 
@@ -114,9 +127,17 @@ class Duration(_Literal):
 
     @property
     def py_val(self) -> dt.timedelta:
-        sign, days, hours, minutes, seconds = self.unpack()
+        sign, years, months, days, hours, minutes, seconds = self.unpack()
+
+        # Initialize days to 0 if None
+        num_days = float(days or 0)
+
+        # Approximate conversion, adjust as necessary for more precision
+        num_days += float(years or 0) * 365.25  # Average including leap years
+        num_days += float(months or 0) * 30.44  # Average month length
+
         delta = dt.timedelta(
-            days=float(days or 0),
+            days=num_days,
             hours=float(hours or 0),
             minutes=float(minutes or 0),
             seconds=float(seconds or 0),
@@ -128,25 +149,33 @@ class Duration(_Literal):
     def unpack(
         self,
     ) -> Tuple[
-        Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]
+        Optional[str],
+        Optional[str],
+        Optional[str],
+        Optional[str],
+        Optional[str],
+        Optional[str],
+        Optional[str],
     ]:
         """
         Returns:
-            ``(sign, days, hours, minutes, seconds)``
+            ``(sign, years, months, days, hours, minutes, seconds)``
         """
 
         match = DURATION_PATTERN.fullmatch(self.val)
         if not match:
             raise ValueError(f"Could not unpack Duration with value {self.val}")
 
-        sign, days, hours, minutes, seconds = match.groups()
+        sign, years, months, days, hours, minutes, seconds = match.groups()
 
+        _years = years[:-1] if years else None
+        _months = months[:-1] if months else None
         _days = days[:-1] if days else None
         _hours = hours[:-1] if hours else None
         _minutes = minutes[:-1] if minutes else None
         _seconds = seconds[:-1] if seconds else None
 
-        return sign, _days, _hours, _minutes, _seconds
+        return sign, _years, _months, _days, _hours, _minutes, _seconds
 
 
 @dataclass(frozen=True)
@@ -321,6 +350,12 @@ class UnaryOp(_Node):
 ###############################################################################
 # Function calls
 ###############################################################################
+@dataclass(frozen=True)
+class NamedParam(_Node):
+    name: Identifier
+    param: _Node
+
+
 @dataclass(frozen=True)
 class Call(_Node):
     func: Identifier
