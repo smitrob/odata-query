@@ -1,420 +1,204 @@
-import logging
-from typing import Optional
+"""DynamoDB backend for odata-query.
 
-from odata_query import ast, exceptions, typing, visitor
+Converts OData $filter ASTs directly to boto3 ``ConditionBase`` objects
+without using ``eval()``.
 
-log = logging.getLogger(__name__)
+Example::
+
+    from odata_query.dynamo import apply_odata_query
+
+    condition = apply_odata_query("status eq 'active' and age gt 18")
+    # Returns: Attr('status').eq('active') & Attr('age').gt(18)
+
+    response = table.query(
+        KeyConditionExpression=Key('pk').eq('user#tenant1'),
+        FilterExpression=condition,
+    )
+"""
+
+from __future__ import annotations
+
+from boto3.dynamodb.conditions import Attr, ConditionBase
+
+from .. import ast, exceptions, visitor
+from ..grammar import parse_odata
 
 
-class AstToDynamoVisitor(visitor.NodeVisitor):
+class AstToDynamoConditionVisitor(visitor.NodeVisitor):
+    """Build boto3 DynamoDB conditions directly from the OData AST.
+
+    Unlike the string-building visitors used by other backends, this visitor
+    returns live boto3 ``ConditionBase`` objects at every node — no
+    ``eval()`` required.
     """
-    :class:`NodeVisitor` that transforms an :term:`AST` into a SQL ``WHERE``
-    clause. Based on SQL-99 as described here: https://crate.io/docs/sql-99/en/latest/
-
-    Args:
-        table_alias: Optional alias for the root table.
-    """
-
-    def __init__(self, table_alias: Optional[str] = None):
-        super().__init__()
-        self.table_alias = table_alias
 
     def visit_Identifier(self, node: ast.Identifier) -> str:
         ":meta private:"
-        # Double quotes for column names acc SQL Standard
-        sql_id = f'"{node.name}"'
+        return ".".join((*node.namespace, node.name)) if node.namespace else node.name
 
-        if self.table_alias:
-            sql_id = f'"{self.table_alias}".' + sql_id
-
-        return sql_id
-
-    def visit_Null(self, node: ast.Null) -> str:
+    def visit_Attribute(self, node: ast.Attribute) -> str:
         ":meta private:"
-        return "NULL"
+        owner = self.visit(node.owner)
+        return f"{owner}.{node.attr}"
 
-    def visit_Integer(self, node: ast.Integer) -> str:
+    def visit_Integer(self, node: ast.Integer) -> int:
         ":meta private:"
-        return node.val
+        return node.py_val
 
-    def visit_Float(self, node: ast.Float) -> str:
+    def visit_Float(self, node: ast.Float) -> float:
         ":meta private:"
-        return node.val
+        return node.py_val
 
-    def visit_Boolean(self, node: ast.Boolean) -> str:
+    def visit_Boolean(self, node: ast.Boolean) -> bool:
         ":meta private:"
-        return node.val.upper()
+        return node.py_val
 
     def visit_String(self, node: ast.String) -> str:
         ":meta private:"
-        # Replace single quotes with double single-quotes acc SQL standard:
-        val = node.val.replace("'", "''")
-        # Wrap in single quotes for string constants acc SQL Standard
-        return f"'{val}'"
+        return node.py_val
 
-    def visit_Date(self, node: ast.Date) -> str:
+    def visit_Null(self, node: ast.Null) -> None:
         ":meta private:"
-        # Single quotes for date constants acc SQL Standard
-        return f"DATE '{node.val}'"
+        return None
 
-    def visit_DateTime(self, node: ast.DateTime) -> str:
+    def visit_GUID(self, node: ast.GUID):
         ":meta private:"
-        sql_ts = node.val.replace("T", " ")
-        # Single quotes for datetime constants acc SQL Standard
-        return f"TIMESTAMP '{sql_ts}'"
+        return node.py_val
 
-    def visit_Duration(self, node: ast.Duration) -> str:
+    def visit_Date(self, node: ast.Date):
         ":meta private:"
-        sign, days, hours, minutes, seconds = node.unpack()
+        return node.py_val
 
-        sign = sign or ""
-        intervals = []
-        if days:
-            intervals.append(f"INTERVAL '{days}' DAY")
-        if hours:
-            intervals.append(f"INTERVAL '{hours}' HOUR")
-        if minutes:
-            intervals.append(f"INTERVAL '{minutes}' MINUTE")
-        if seconds:
-            intervals.append(f"INTERVAL '{seconds}' SECOND")
-
-        if len(intervals) == 0:
-            # Shouldn't occur but whatever
-            return ""
-        if len(intervals) == 1:
-            return f"{sign}{intervals[0]}"
-        if len(intervals) > 1:
-            interval = " + ".join(intervals)
-            return f"{sign}({interval})"
-
-        # Make Quality checks happy:
-        raise Exception("This code is never reachable...")
-
-    def visit_GUID(self, node: ast.GUID) -> str:
+    def visit_Time(self, node: ast.Time):
         ":meta private:"
-        return f"'{node.val}'"
+        return node.py_val
 
-    def visit_List(self, node: ast.List) -> str:
+    def visit_DateTime(self, node: ast.DateTime):
         ":meta private:"
-        options = ", ".join(self.visit(n) for n in node.val)
-        return f"({options})"
+        return node.py_val
 
-    def visit_Add(self, node: ast.Add) -> str:
+    def visit_Duration(self, node: ast.Duration):
         ":meta private:"
-        return "+"
+        return node.py_val
 
-    def visit_Sub(self, node: ast.Sub) -> str:
+    def visit_List(self, node: ast.List) -> list:
         ":meta private:"
-        return "-"
+        return [self.visit(item) for item in node.val]
 
-    def visit_Mult(self, node: ast.Mult) -> str:
+    def visit_Function(self, node: ast.Function) -> ConditionBase:
         ":meta private:"
-        return "*"
+        field_name = self._field_name(node.left)
+        if isinstance(node.function, ast.Exists):
+            return Attr(field_name).exists()
+        if isinstance(node.function, ast.Not_Exists):
+            return Attr(field_name).not_exists()
+        raise exceptions.UnsupportedFunctionException(type(node.function).__name__)
 
-    def visit_Div(self, node: ast.Div) -> str:
+    def visit_Compare(self, node: ast.Compare) -> ConditionBase:
         ":meta private:"
-        return "/"
+        field_name = self._field_name(node.left)
+        field = Attr(field_name)
 
-    def visit_Mod(self, node: ast.Mod) -> str:
-        ":meta private:"
-        return "%"
-
-    def visit_BinOp(self, node: ast.BinOp) -> str:
-        ":meta private:"
-        left = self.visit(node.left)
-        right = self.visit(node.right)
-        op = self.visit(node.op)
-
-        return f"{left} {op} {right}"
-
-    def visit_Eq(self, node: ast.Eq) -> str:
-        ":meta private:"
-        return "eq"
-
-    def visit_NotEq(self, node: ast.NotEq) -> str:
-        ":meta private:"
-        return "ne"
-
-    def visit_Lt(self, node: ast.Lt) -> str:
-        ":meta private:"
-        return "lt"
-
-    def visit_LtE(self, node: ast.LtE) -> str:
-        ":meta private:"
-        return "lte"
-
-    def visit_Gt(self, node: ast.Gt) -> str:
-        ":meta private:"
-        return "gt"
-
-    def visit_GtE(self, node: ast.GtE) -> str:
-        ":meta private:"
-        return "gte"
-
-    def visit_In(self, node: ast.In) -> str:
-        ":meta private:"
-        return "is_in"
-
-    def visit_Between(self, node: ast.Between) -> str:
-        ":meta private:"
-        return "between"
-
-    # def visit_Exists(self, node: ast.Exists) -> str:
-    #     ":meta private:"
-    #     return "exists"
-
-    def visit_Compare(self, node: ast.Compare) -> str:
-        ":meta private:"
-        left = self.visit(node.left)
-        right = self.visit(node.right)
-        comparator = self.visit(node.comparator)
-
-        # In case of a subexpression, wrap it in parentheses
-        if isinstance(node.left, (ast.BoolOp, ast.Compare)):
-            left = f"({left})"
-        if isinstance(node.right, (ast.BoolOp, ast.Compare)):
-            right = f"({right})"
-
-        #  'eq/ne null' should become 'IS (NOT) NULL' instead of '(!)= NULL'
+        # DynamoDB has two distinct "no value" states:
+        #   State 1 - attribute is absent (never stored / deleted)
+        #   State 2 - attribute exists with DynamoDB NULL type
+        #
+        # 'field eq null' -> absent OR null-typed   (covers both states)
+        # 'field ne null' -> exists AND not null-typed  (has a real value)
         if isinstance(node.right, ast.Null):
             if isinstance(node.comparator, ast.Eq):
-                comparator = "IS"
-            elif isinstance(node.comparator, ast.NotEq):
-                comparator = "IS NOT"
+                return field.not_exists() | field.attribute_type("NULL")
+            if isinstance(node.comparator, ast.NotEq):
+                return field.exists() & ~field.attribute_type("NULL")
 
-        # Attr('tenant_id').contains('b79')
-        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/customizations/dynamodb.html
-        if comparator == 'is_in':
-            return f" Attr({left}).{comparator}{right}"
-        else:
-            return f" Attr({left}).{comparator}({right})"
+        if isinstance(node.comparator, ast.Between):
+            values = self.visit(node.right)
+            if not isinstance(values, list) or len(values) != 2:
+                raise exceptions.ArgumentTypeException("between", "two-item list")
+            return field.between(values[0], values[1])
 
-        # return f"{left} {comparator} {right}"
+        value = self.visit(node.right)
+        if isinstance(node.comparator, ast.Eq):
+            return field.eq(value)
+        if isinstance(node.comparator, ast.NotEq):
+            return field.ne(value)
+        if isinstance(node.comparator, ast.Lt):
+            return field.lt(value)
+        if isinstance(node.comparator, ast.LtE):
+            return field.lte(value)
+        if isinstance(node.comparator, ast.Gt):
+            return field.gt(value)
+        if isinstance(node.comparator, ast.GtE):
+            return field.gte(value)
+        if isinstance(node.comparator, ast.In):
+            values = value if isinstance(value, list) else [value]
+            return field.is_in(values)
 
-    def visit_And(self, node: ast.And) -> str:
-        ":meta private:"
-        return "and"
+        raise exceptions.UnsupportedFunctionException(type(node.comparator).__name__)
 
-    def visit_Or(self, node: ast.Or) -> str:
-        ":meta private:"
-        return "or"
-
-    def visit_BoolOp(self, node: ast.BoolOp) -> str:
+    def visit_BoolOp(self, node: ast.BoolOp) -> ConditionBase:
         ":meta private:"
         left = self.visit(node.left)
-        op = self.visit(node.op)
         right = self.visit(node.right)
 
-        # In case of a subexpression, wrap it in parentheses
-        # UNLESS it has the same operator as the current BoolOp, e.g.:
-        # x AND y AND z
-        if isinstance(node.left, ast.BoolOp) and node.left.op != node.op:
-            left = f"({left})"
-        if isinstance(node.right, ast.BoolOp) and node.right.op != node.op:
-            right = f"({right})"
+        if isinstance(node.op, ast.And):
+            return left & right
+        if isinstance(node.op, ast.Or):
+            return left | right
 
-        return f"{left} {op} {right}"
+        raise exceptions.UnsupportedFunctionException(type(node.op).__name__)
 
-    def visit_Not(self, node: ast.Not) -> str:
+    def visit_UnaryOp(self, node: ast.UnaryOp) -> ConditionBase:
         ":meta private:"
-        return "not"
-
-    def visit_UnaryOp(self, node: ast.UnaryOp) -> str:
-        ":meta private:"
-        op = self.visit(node.op)
         operand = self.visit(node.operand)
+        if isinstance(node.op, ast.Not):
+            return ~operand
+        raise exceptions.UnsupportedFunctionException(type(node.op).__name__)
 
-        # In case of a subexpression, wrap it in parentheses
-        if isinstance(node.operand, ast.BoolOp):
-            operand = f"({operand})"
-
-        return f"{op} {operand}"
-
-    def visit_Call(self, node: ast.Call) -> str:
+    def visit_Call(self, node: ast.Call) -> ConditionBase:
         ":meta private:"
-        try:
-            # Grammar has already validated that the function is valid OData,
-            # but that doesn't guarantee we can represent it in SQL:
-            sql_gen = getattr(self, "sqlfunc_" + node.func.name.lower())
-        except AttributeError:
-            raise exceptions.UnsupportedFunctionException(node.func.name)
+        func_name = node.func.name.lower()
 
-        return sql_gen(*node.args)
+        if func_name == "contains":
+            field_name = self._field_name(node.args[0])
+            return Attr(field_name).contains(self.visit(node.args[1]))
+        if func_name == "startswith":
+            field_name = self._field_name(node.args[0])
+            return Attr(field_name).begins_with(self.visit(node.args[1]))
 
-    def sqlfunc_concat(self, *args: ast._Node) -> str:
-        ":meta private:"
-        args_sql = [self.visit(arg) for arg in args]
-        return f"{args_sql[0]} || {args_sql[1]}"
+        raise exceptions.UnsupportedFunctionException(node.func.name)
 
-    def _to_pattern(self, arg: ast._Node, prefix: str = "", suffix: str = "") -> str:
-        """
-        Transform a node into a pattern usable in `LIKE` clauses.
-        :meta private:
-        """
-        if isinstance(arg, (ast.Identifier, ast.Call)):
-            res = self.visit(arg)
-            if prefix:
-                res = f"'{prefix}' || " + res
-            if suffix:
-                res = res + f" || '{suffix}'"
-        else:
-            res = str(arg.val).replace("%", "%%").replace("_", "__")  # type: ignore
-            res = "'" + prefix + res + suffix + "'"
-        return res
-
-    # def visit_Eq(self, node: ast.Eq) -> str:
-    #     ":meta private:"
-    #     return "eq"
-
-    # def visit_Contains(self, node: ast.Eq) -> str:
-    #     ":meta private:"
-    #     return "contains"
-    def sqlfunc_between(self, *args: ast._Node) -> str:
-        ":meta private:"
-        args_sql = [self.visit(arg) for arg in args]
-        return f"Attr({args_sql[0]}).contains({args_sql[1]})"
-
-    def sqlfunc_contains(self, *args: ast._Node) -> str:
-        ":meta private:"
-        args_sql = [self.visit(arg) for arg in args]
-        return f"Attr({args_sql[0]}).contains({args_sql[1]})"
+    def _field_name(self, node: ast._Node) -> str:
+        if isinstance(node, (ast.Identifier, ast.Attribute)):
+            return self.visit(node)
+        raise exceptions.ArgumentTypeException(
+            "field", "Identifier", type(node).__name__
+        )
 
 
-    def sqlfunc_endswith(self, *args: ast._Node) -> str:
-        ":meta private:"
-        args_sql = [self.visit(arg) for arg in args]
-        return f"Attr({args_sql[0]}).ends_with({args_sql[1]})"
+def apply_odata_query(filter_str: str) -> ConditionBase:
+    """Parse an OData ``$filter`` string and return a boto3 ``ConditionBase``.
 
-    def sqlfunc_indexof(self, *args: ast._Node) -> str:
-        ":meta private:"
-        args_sql = [self.visit(arg) for arg in args]
-        inferred_type = [typing.infer_type(arg) for arg in args]
+    This is a convenience wrapper around :class:`AstToDynamoConditionVisitor`.
 
-        # If any of the inputs is a string, assume str-indexof:
-        if any(typ is ast.String for typ in inferred_type) or all(
-            typ is None for typ in inferred_type
-        ):
-            return f"POSITION({args_sql[1]} IN {args_sql[0]}) - 1"
+    Args:
+        filter_str: OData filter expression, e.g. ``"status eq 'active' and age gt 18"``
 
-        # If any of the inputs is a list, assume list-indexof
-        # which isn't easily doable at the moment:
-        if any(typ is ast.List for typ in inferred_type):
-            raise exceptions.UnsupportedFunctionException("indexof<List>")
+    Returns:
+        A boto3 ``ConditionBase`` that can be passed directly as
+        ``FilterExpression`` to a DynamoDB table query or scan.
 
-        raise exceptions.ArgumentTypeException("indexof")
+    Raises:
+        InvalidQueryException: If the filter string cannot be parsed.
+        UnsupportedFunctionException: If an unsupported OData function is used.
 
-    def sqlfunc_length(self, arg: ast._Node) -> str:
-        ":meta private:"
-        arg_sql = self.visit(arg)
-        inferred_type = typing.infer_type(arg)
+    Example::
 
-        # If the input is a string or default, assume str-length:
-        if inferred_type is ast.String or inferred_type is None:
-            return f"CHAR_LENGTH({arg_sql})"
-
-        # If the input is a list, assume list-length:
-        if inferred_type is ast.List:
-            return f"CARDINALITY({arg_sql})"
-
-        raise exceptions.ArgumentTypeException("length")
-
-    def sqlfunc_startswith(self, *args: ast._Node) -> str:
-        ":meta private:"
-        args_sql = [self.visit(arg) for arg in args]
-        return f"Attr({args_sql[0]}).begins_with({args_sql[1]})"
-
-    def sqlfunc_substring(self, *args: ast._Node) -> str:
-        ":meta private:"
-        args_sql = [self.visit(arg) for arg in args]
-        inferred_type = typing.infer_type(args[0])
-
-        # If the first input is a string or default, assume str-substr:
-        if inferred_type is ast.String or inferred_type is None:
-            if len(args) == 2:
-                return f"SUBSTRING({args_sql[0]} FROM {args_sql[1]} + 1)"
-            if len(args) == 3:
-                return (
-                    f"SUBSTRING({args_sql[0]} FROM {args_sql[1]} + 1 FOR {args_sql[2]})"
-                )
-
-        # If the first input is a list, assume list-substr:
-        if inferred_type is ast.List:
-            raise exceptions.UnsupportedFunctionException("substring<List>")
-
-        raise exceptions.ArgumentTypeException("substring")
-
-    def sqlfunc_tolower(self, arg: ast._Node) -> str:
-        ":meta private:"
-        arg_sql = self.visit(arg)
-        return f"LOWER({arg_sql})"
-
-    def sqlfunc_toupper(self, arg: ast._Node) -> str:
-        ":meta private:"
-        arg_sql = self.visit(arg)
-        return f"UPPER({arg_sql})"
-
-    def sqlfunc_trim(self, arg: ast._Node) -> str:
-        ":meta private:"
-        arg_sql = self.visit(arg)
-        return f"TRIM({arg_sql})"
-
-    def sqlfunc_year(self, arg: ast._Node) -> str:
-        ":meta private:"
-        arg_sql = self.visit(arg)
-        return f"EXTRACT (YEAR FROM {arg_sql})"
-
-    def sqlfunc_month(self, arg: ast._Node) -> str:
-        ":meta private:"
-        arg_sql = self.visit(arg)
-        return f"EXTRACT (MONTH FROM {arg_sql})"
-
-    def sqlfunc_day(self, arg: ast._Node) -> str:
-        ":meta private:"
-        arg_sql = self.visit(arg)
-        return f"EXTRACT (DAY FROM {arg_sql})"
-
-    def sqlfunc_hour(self, arg: ast._Node) -> str:
-        ":meta private:"
-        arg_sql = self.visit(arg)
-        return f"EXTRACT (HOUR FROM {arg_sql})"
-
-    def sqlfunc_minute(self, arg: ast._Node) -> str:
-        ":meta private:"
-        arg_sql = self.visit(arg)
-        return f"EXTRACT (MINUTE FROM {arg_sql})"
-
-    def sqlfunc_date(self, arg: ast._Node) -> str:
-        ":meta private:"
-        arg_sql = self.visit(arg)
-        return f"CAST ({arg_sql} AS DATE)"
-
-    def sqlfunc_now(self) -> str:
-        ":meta private:"
-        return "CURRENT_TIMESTAMP"
-
-    def sqlfunc_round(self, arg: ast._Node) -> str:
-        ":meta private:"
-        arg_sql = self.visit(arg)
-        return f"CAST ({arg_sql} + 0.5 AS INTEGER)"
-
-    def sqlfunc_floor(self, arg: ast._Node) -> str:
-        ":meta private:"
-        arg_sql = self.visit(arg)
-        return f"""CASE {arg_sql}
-    WHEN > 0 CAST ({arg_sql} AS INTEGER)
-    WHEN < 0 CAST (0 - (ABS({arg_sql}) + 0.5) AS INTEGER))
-    ELSE {arg_sql}
-END"""
-
-    def sqlfunc_ceiling(self, arg: ast._Node) -> str:
-        ":meta private:"
-        arg_sql = self.visit(arg)
-        return f"""CASE {arg_sql} - CAST ({arg_sql} AS INTEGER)
-    WHEN > 0 {arg_sql}+1
-    WHEN < 0 {arg_sql}-1
-    ELSE {arg_sql}
-END"""
-
-    def sqlfunc_hassubset(self, *args: ast._Node) -> str:
-        ":meta private:"
-        raise exceptions.UnsupportedFunctionException("hassubset")
+        condition = apply_odata_query("status eq 'active' and age gt 18")
+        response = table.query(
+            KeyConditionExpression=Key('pk').eq('TENANT#acme'),
+            FilterExpression=condition,
+        )
+    """
+    ast_tree = parse_odata(filter_str)
+    return AstToDynamoConditionVisitor().visit(ast_tree)
